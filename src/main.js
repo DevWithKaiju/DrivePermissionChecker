@@ -1,94 +1,108 @@
-// メインの関数
-function checkPermissionsAndNotifySlack() {
-  const folderId = ""; // 対象フォルダのID
-  const slackWebhookUrl = ""; // SlackのWebhook URL
-  const allowedDomains = [".fw@gmail.com", "@gmail.com"]; // 許可するメールアドレスのドメイン
+const SETTINGS = {
+  TARGET_FOLDER: '', // チェック対象フォルダID
+  SLACK_URL: '', // Slack通知用Webhook URL
+  SAFE_DOMAINS: ['fw@gmail.com', 'gmail.com'], // 許可ドメイン
+  IGNORE_KEYWORD: '【共有用】' // チェック除外キーワード
+};
 
-  const folder = DriveApp.getFolderById(folderId);
-  const results = processFolder(folder, allowedDomains);
-
-  notifySlack(slackWebhookUrl, results);
+function main() {
+  const violations = [];
+  walkFolder(SETTINGS.TARGET_FOLDER, violations);
+  
+  if (violations.length > 0) {
+    postSlack(violations);
+  } else {
+    console.log('異常なし');
+  }
 }
 
-// 再帰的にフォルダを処理する関数
-function processFolder(folder, allowedDomains) {
-  const results = [];
+// 再帰的に探索
+function walkFolder(folderId, outputList) {
+  let pageToken = null;
+  const fields = 'nextPageToken, files(id, name, mimeType, webViewLink, permissions(emailAddress, role, type), shared)';
 
-  const files = folder.getFiles();
-  while (files.hasNext()) {
-    const file = files.next();
+  do {
+    const res = Drive.Files.list({
+      q: `'${folderId}' in parents and trashed = false`,
+      pageToken: pageToken,
+      pageSize: 1000,
+      fields: fields
+    });
 
-    // ファイル名に【共有用】が含まれる場合はスキップ
-    if (file.getName().includes("【共有用】")) {
-      continue;
+    const files = res.files || [];
+    if (!files.length) return;
+
+    for (const file of files) {
+      if (file.mimeType === 'application/vnd.google-apps.folder') {
+        walkFolder(file.id, outputList);
+      } else {
+        // ファイル名チェック
+        if (file.name.includes(SETTINGS.IGNORE_KEYWORD)) continue;
+        
+        const errors = validatePermissions(file);
+        if (errors.length) {
+          outputList.push({
+            name: file.name,
+            url: file.webViewLink,
+            errors: errors
+          });
+        }
+      }
     }
-
-    const issues = checkFilePermissions(file, allowedDomains);
-    if (issues.length > 0) {
-      results.push({
-        name: file.getName(),
-        link: file.getUrl(),
-        issues: issues,
-      });
-    }
-  }
-
-  const subFolders = folder.getFolders();
-  while (subFolders.hasNext()) {
-    const subFolder = subFolders.next();
-    results.push(...processFolder(subFolder, allowedDomains));
-  }
-
-  return results;
+    pageToken = res.nextPageToken;
+  } while (pageToken);
 }
 
-// ファイルの権限を確認する関数
-function checkFilePermissions(file, allowedDomains) {
-  const issues = [];
-  const permissions = file.getSharingAccess();
-  const editors = file.getEditors();
-  const viewers = file.getViewers();
+// 権限の中身を検証
+function validatePermissions(file) {
+  if (!file.shared || !file.permissions) return [];
 
-  // 「リンクを知っている人全員」かどうか確認
-  if (permissions === DriveApp.Access.ANYONE_WITH_LINK) {
-    issues.push("リンクを知っている人全員にアクセス可能");
+  const errors = [];
+  
+  // リンク共有チェック
+  if (file.permissions.some(p => p.type === 'anyone')) {
+    errors.push('⚠️ リンクを知っている全員がアクセス可能');
   }
 
-  // 許可されていないメールアドレスを確認
-  [...editors, ...viewers].forEach(user => {
-    const email = user.getEmail();
-    const isAllowed = allowedDomains.some(domain => email.endsWith(domain));
-    if (!isAllowed) {
-      issues.push(`許可されていない共有: ${email}`);
+  // ドメインチェック
+  for (const p of file.permissions) {
+    if (p.role === 'owner' || !p.emailAddress) continue;
+    
+    const isSafe = SETTINGS.SAFE_DOMAINS.some(d => p.emailAddress.endsWith(d));
+    if (!isSafe) {
+      errors.push(`🚫 外部共有: ${p.emailAddress} [${p.role}]`);
     }
+  }
+
+  return errors;
+}
+
+// 通知送信
+function postSlack(data) {
+  console.log(`${data.length}件の違反を検出。`);
+
+  // 上位30件のみ
+  const displayLimit = 30;
+  const attachments = data.slice(0, displayLimit).map(d => ({
+    color: '#danger',
+    title: d.name,
+    title_link: d.url,
+    text: d.errors.join('\n')
+  }));
+
+  if (data.length > displayLimit) {
+    attachments.push({
+      text: `...他 ${data.length - displayLimit} 件（件数が多いため省略）`,
+      color: '#warning'
+    });
+  }
+
+  UrlFetchApp.fetch(SETTINGS.SLACK_URL, {
+    method: 'post',
+    contentType: 'application/json',
+    payload: JSON.stringify({
+      text: `🚨 Drive権限チェック: ${data.length}件の不備が見つかりました`,
+      attachments: attachments
+    })
   });
-
-  return issues;
-}
-
-// Slackに通知を送信する関数
-function notifySlack(slackWebhookUrl, results) {
-  if (results.length === 0) {
-    Logger.log("該当するファイルはありません。");
-    return;
-  }
-
-  const payload = {
-    text: `以下のファイルで権限の問題が見つかりました:`,
-    attachments: results.map(result => ({
-      title: result.name,
-      title_link: result.link,
-      text: result.issues.join("\n"),
-      color: "#ff0000",
-    })),
-  };
-
-  const options = {
-    method: "post",
-    contentType: "application/json",
-    payload: JSON.stringify(payload),
-  };
-
-  UrlFetchApp.fetch(slackWebhookUrl, options);
-  Logger.log("Slackに通知を送信しました。");
 }
